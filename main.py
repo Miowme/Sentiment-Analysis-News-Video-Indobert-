@@ -55,18 +55,27 @@ async def scrape_youtube_api(request: URLRequest):
         raise HTTPException(status_code=400, detail="ID Video tidak ditemukan dalam URL")
 
     try:
-        youtube_request = youtube.commentThreads().list(
-            part="snippet",
-            videoId=video_id,
-            maxResults=500, 
-            textFormat="plainText"
-        )
-        response = youtube_request.execute()
-
         comments = []
-        for item in response.get('items', []):
-            comment_text = item['snippet']['topLevelComment']['snippet']['textDisplay']
-            comments.append(comment_text)
+        next_page_token = None
+
+        while True:
+            youtube_request = youtube.commentThreads().list(
+                part="snippet",
+                videoId=video_id,
+                maxResults=100, 
+                textFormat="plainText",
+                pageToken=next_page_token 
+            )
+            response = youtube_request.execute()
+
+            for item in response.get('items', []):
+                comment_text = item['snippet']['topLevelComment']['snippet']['textDisplay']
+                comments.append(comment_text)
+
+            next_page_token = response.get('nextPageToken')
+
+            if not next_page_token:
+                break
 
         if not comments:
             return {"status": "Empty", "message": "Tidak ada komentar ditemukan atau dinonaktifkan."}
@@ -97,33 +106,56 @@ async def analyze_sentiment(request: URLRequest):
         raise HTTPException(status_code=404, detail="Data belum di-scrape. Jalankan /scrapping dulu.")
 
     if classifier is None:
-        raise HTTPException(status_code=500, detail="Model belum siap.")
+        raise HTTPException(status_code=500, detail="Model IndoBERT belum dimuat/siap.")
 
     texts = raw_data["comments"]
-    results = classifier(texts)
-
     processed = []
     labels = []
-    for text, res in zip(texts, results):
-        label = LABEL_INDEX.get(res['label'], "unknown")
-        labels.append(label)
-        processed.append({"text": text, "label": label, "confidence": f"{res['score']*100:.2f}%"})
+
+    batch_size = 32  
+    
+    print(f"--- Mulai Analisis {len(texts)} komentar... ---")
+
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i : i + batch_size]
+
+        batch_results = await asyncio.to_thread(classifier, batch_texts)
+
+        for text, res in zip(batch_texts, batch_results):
+            label = LABEL_INDEX.get(res['label'], "unknown")
+            labels.append(label)
+            processed.append({
+                "text": text, 
+                "label": label, 
+                "confidence": f"{res['score']*100:.2f}%"
+            })
 
     counts = Counter(labels)
+
+    overall_sentiment = "N/A"
+    if counts:
+        overall_sentiment = counts.most_common(1)[0][0]
+
     analysis_doc = {
         "video_id": video_id,
         "summary": {
             "total": len(processed),
-            "overall": counts.most_common(1)[0][0],
+            "overall": overall_sentiment,
             "counts": dict(counts)
         },
         "results": processed,
         "analyzed_at": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
-    await analysis_collection.insert_one(analysis_doc)
+    await analysis_collection.update_one(
+        {"video_id": video_id},
+        {"$set": analysis_doc},
+        upsert=True
+    )
+    
     if "_id" in analysis_doc: del analysis_doc["_id"]
 
+    print(f"--- Analisis Selesai untuk Video: {video_id} ---")
     return analysis_doc
 
 @app.get("/all-results")
